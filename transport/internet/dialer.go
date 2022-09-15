@@ -70,7 +70,13 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *MemoryStrea
 func DialSystem(ctx context.Context, dest net.Destination, sockopt *SocketConfig) (net.Conn, error) {
 	var src net.Address
 	if outbound := session.OutboundFromContext(ctx); outbound != nil {
-		src = outbound.Gateway
+		if outbound.Gateway == net.IPAddress([]byte{0, 0, 0, 0}){
+			if inbound := session.InboundFromContext(ctx); inbound != nil{
+				src = inbound.Source.Address
+			}
+		} else{
+			src = outbound.Gateway
+		}
 	}
 
 	if transportLayerOutgoingTag := session.GetTransportLayerProxyTagFromContext(ctx); transportLayerOutgoingTag != "" {
