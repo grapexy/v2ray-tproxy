@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -194,6 +195,16 @@ func (c *Config) verifyPeerCert(rawCerts [][]byte, verifiedChains [][]*x509.Cert
 	return nil
 }
 
+type alwaysFlushWriter struct {
+	file *os.File
+}
+
+func (a *alwaysFlushWriter) Write(p []byte) (n int, err error) {
+	n, err = a.file.Write(p)
+	a.file.Sync()
+	return n, err
+}
+
 // GetTLSConfig converts this Config into tls.Config.
 func (c *Config) GetTLSConfig(opts ...Option) *tls.Config {
 	root, err := c.getCertPool()
@@ -226,6 +237,10 @@ func (c *Config) GetTLSConfig(opts ...Option) *tls.Config {
 		ClientCAs:              clientRoot,
 	}
 
+	if c.AllowInsecureIfPinnedPeerCertificate && c.PinnedPeerCertificateChainSha256 != nil {
+		config.InsecureSkipVerify = true
+	}
+
 	for _, opt := range opts {
 		opt(config)
 	}
@@ -249,6 +264,36 @@ func (c *Config) GetTLSConfig(opts ...Option) *tls.Config {
 	if c.VerifyClientCertificate {
 		config.ClientAuth = tls.RequireAndVerifyClientCert
 	}
+
+	switch c.MinVersion {
+	case Config_TLS1_0:
+		config.MinVersion = tls.VersionTLS10
+	case Config_TLS1_1:
+		config.MinVersion = tls.VersionTLS11
+	case Config_TLS1_2:
+		config.MinVersion = tls.VersionTLS12
+	case Config_TLS1_3:
+		config.MinVersion = tls.VersionTLS13
+	}
+
+	switch c.MaxVersion {
+	case Config_TLS1_0:
+		config.MaxVersion = tls.VersionTLS10
+	case Config_TLS1_1:
+		config.MaxVersion = tls.VersionTLS11
+	case Config_TLS1_2:
+		config.MaxVersion = tls.VersionTLS12
+	case Config_TLS1_3:
+		config.MaxVersion = tls.VersionTLS13
+	}
+
+	if len(c.EchConfig) > 0 || len(c.Ech_DOHserver) > 0 {
+		err := ApplyECH(c, config)
+		if err != nil {
+			newError("unable to set ECH").AtError().Base(err).WriteToLog()
+		}
+	}
+
 	return config
 }
 
@@ -258,8 +303,13 @@ type Option func(*tls.Config)
 // WithDestination sets the server name in TLS config.
 func WithDestination(dest net.Destination) Option {
 	return func(config *tls.Config) {
-		if dest.Address.Family().IsDomain() && config.ServerName == "" {
-			config.ServerName = dest.Address.Domain()
+		if config.ServerName == "" {
+			switch dest.Address.Family() {
+			case net.AddressFamilyDomain:
+				config.ServerName = dest.Address.Domain()
+			case net.AddressFamilyIPv4, net.AddressFamilyIPv6:
+				config.ServerName = dest.Address.IP().String()
+			}
 		}
 	}
 }
@@ -278,9 +328,11 @@ func ConfigFromStreamSettings(settings *internet.MemoryStreamConfig) *Config {
 	if settings == nil {
 		return nil
 	}
-	config, ok := settings.SecuritySettings.(*Config)
-	if !ok {
+	if settings.SecuritySettings == nil {
 		return nil
 	}
+	// Fail close for unknown TLS settings type.
+	// For TLS Clients, Security Engine should be used, instead of this.
+	config := settings.SecuritySettings.(*Config)
 	return config
 }

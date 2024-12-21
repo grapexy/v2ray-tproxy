@@ -17,6 +17,9 @@ type PacketAddrDispatcher struct {
 }
 
 func (p PacketAddrDispatcher) Close() error {
+	if p.ctx.Value(DispatcherConnectionTerminationSignalReceiverMark) != nil {
+		p.ctx.Value(DispatcherConnectionTerminationSignalReceiverMark).(DispatcherConnectionTerminationSignalReceiver).Close()
+	}
 	return p.conn.Close()
 }
 
@@ -24,6 +27,12 @@ func (p PacketAddrDispatcher) Dispatch(ctx context.Context, destination net.Dest
 	if destination.Network != net.Network_UDP {
 		return
 	}
+
+	// Processing of domain address is unsupported as it adds unpredictable overhead, it will be dropped.
+	if destination.Address.Family().IsDomain() {
+		return
+	}
+
 	p.conn.WriteTo(payload.Bytes(), &net.UDPAddr{IP: destination.Address.IP(), Port: int(destination.Port.Value())})
 }
 

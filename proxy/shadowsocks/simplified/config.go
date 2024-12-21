@@ -2,12 +2,35 @@ package simplified
 
 import (
 	"context"
+	"encoding/json"
+
+	"github.com/golang/protobuf/jsonpb"
 
 	"github.com/v2fly/v2ray-core/v5/common"
 	"github.com/v2fly/v2ray-core/v5/common/protocol"
 	"github.com/v2fly/v2ray-core/v5/common/serial"
 	"github.com/v2fly/v2ray-core/v5/proxy/shadowsocks"
 )
+
+func (c *CipherTypeWrapper) UnmarshalJSONPB(unmarshaler *jsonpb.Unmarshaler, bytes []byte) error {
+	var method string
+
+	if err := json.Unmarshal(bytes, &method); err != nil {
+		return err
+	}
+
+	if c.Value = shadowsocks.CipherFromString(method); c.Value == shadowsocks.CipherType_UNKNOWN {
+		return newError("unknown cipher method: ", method)
+	}
+
+	return nil
+}
+
+func (c *CipherTypeWrapper) MarshalJSONPB(marshaler *jsonpb.Marshaler) ([]byte, error) {
+	method := c.Value.String()
+
+	return json.Marshal(method)
+}
 
 func init() {
 	common.Must(common.RegisterConfig((*ServerConfig)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
@@ -16,10 +39,10 @@ func init() {
 			User: &protocol.User{
 				Account: serial.ToTypedMessage(&shadowsocks.Account{
 					Password:   simplifiedServer.Password,
-					CipherType: simplifiedServer.Method,
+					CipherType: simplifiedServer.Method.Value,
 				}),
 			},
-			Network:        simplifiedServer.Networks.Network,
+			Network:        simplifiedServer.Networks.GetNetwork(),
 			PacketEncoding: simplifiedServer.PacketEncoding,
 		}
 
@@ -37,7 +60,7 @@ func init() {
 						{
 							Account: serial.ToTypedMessage(&shadowsocks.Account{
 								Password:                       simplifiedClient.Password,
-								CipherType:                     simplifiedClient.Method,
+								CipherType:                     simplifiedClient.Method.Value,
 								ExperimentReducedIvHeadEntropy: simplifiedClient.ExperimentReducedIvHeadEntropy,
 							}),
 						},

@@ -14,11 +14,13 @@ var (
 	DialUDP         = net.DialUDP
 	DialUnix        = net.DialUnix
 	FileConn        = net.FileConn
+	FileListener    = net.FileListener
 	Listen          = net.Listen
 	ListenTCP       = net.ListenTCP
 	ListenUDP       = net.ListenUDP
 	ListenUnix      = net.ListenUnix
 	LookupIP        = net.LookupIP
+	ParseCIDR       = net.ParseCIDR
 	ParseIP         = net.ParseIP
 	ResolveUDPAddr  = net.ResolveUDPAddr
 	ResolveUnixAddr = net.ResolveUnixAddr

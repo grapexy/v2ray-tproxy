@@ -23,10 +23,11 @@ import (
 
 // Client is a Socks5 client.
 type Client struct {
-	serverPicker  protocol.ServerPicker
-	policyManager policy.Manager
-	version       Version
-	dns           dns.Client
+	serverPicker   protocol.ServerPicker
+	policyManager  policy.Manager
+	version        Version
+	dns            dns.Client
+	delayAuthWrite bool
 }
 
 // NewClient create a new Socks5 client based on the given config.
@@ -45,9 +46,10 @@ func NewClient(ctx context.Context, config *ClientConfig) (*Client, error) {
 
 	v := core.MustFromContext(ctx)
 	c := &Client{
-		serverPicker:  protocol.NewRoundRobinServerPicker(serverList),
-		policyManager: v.GetFeature(policy.ManagerType()).(policy.Manager),
-		version:       config.Version,
+		serverPicker:   protocol.NewRoundRobinServerPicker(serverList),
+		policyManager:  v.GetFeature(policy.ManagerType()).(policy.Manager),
+		version:        config.Version,
+		delayAuthWrite: config.DelayAuthWrite,
 	}
 	if config.Version == Version_SOCKS4 {
 		c.dns = v.GetFeature(dns.ClientType()).(dns.Client)
@@ -104,17 +106,7 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 	switch c.version {
 	case Version_SOCKS4:
 		if request.Address.Family().IsDomain() {
-			if d, ok := c.dns.(dns.ClientWithIPOption); ok {
-				d.SetFakeDNSOption(false) // Skip FakeDNS
-			} else {
-				newError("DNS client doesn't implement ClientWithIPOption")
-			}
-
-			lookupFunc := c.dns.LookupIP
-			if lookupIPv4, ok := c.dns.(dns.IPv4Lookup); ok {
-				lookupFunc = lookupIPv4.LookupIPv4
-			}
-			ips, err := lookupFunc(request.Address.Domain())
+			ips, err := dns.LookupIPWithOption(c.dns, request.Address.Domain(), dns.IPOption{IPv4Enable: true, IPv6Enable: false, FakeEnable: false})
 			if err != nil {
 				return err
 			} else if len(ips) == 0 {
@@ -146,10 +138,21 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 	if err := conn.SetDeadline(time.Now().Add(p.Timeouts.Handshake)); err != nil {
 		newError("failed to set deadline for handshake").Base(err).WriteToLog(session.ExportIDToError(ctx))
 	}
-	udpRequest, err := ClientHandshake(request, conn, conn)
-	if err != nil {
-		return newError("failed to establish connection to server").AtWarning().Base(err)
+
+	var udpRequest *protocol.RequestHeader
+	var err error
+	if request.Version == socks4Version {
+		err = ClientHandshake4(request, conn, conn)
+		if err != nil {
+			return newError("failed to establish connection to server").AtWarning().Base(err)
+		}
+	} else {
+		udpRequest, err = ClientHandshake(request, conn, conn, c.delayAuthWrite)
+		if err != nil {
+			return newError("failed to establish connection to server").AtWarning().Base(err)
+		}
 	}
+
 	if udpRequest != nil {
 		if udpRequest.Address == net.AnyIP || udpRequest.Address == net.AnyIPv6 {
 			udpRequest.Address = dest.Address

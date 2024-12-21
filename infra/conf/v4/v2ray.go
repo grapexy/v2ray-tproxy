@@ -1,7 +1,10 @@
 package v4
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
+	"path/filepath"
 	"strings"
 
 	"google.golang.org/protobuf/types/known/anypb"
@@ -11,6 +14,7 @@ import (
 	"github.com/v2fly/v2ray-core/v5/app/proxyman"
 	"github.com/v2fly/v2ray-core/v5/app/stats"
 	"github.com/v2fly/v2ray-core/v5/common/serial"
+	"github.com/v2fly/v2ray-core/v5/features"
 	"github.com/v2fly/v2ray-core/v5/infra/conf/cfgcommon"
 	"github.com/v2fly/v2ray-core/v5/infra/conf/cfgcommon/loader"
 	"github.com/v2fly/v2ray-core/v5/infra/conf/cfgcommon/muxcfg"
@@ -19,6 +23,7 @@ import (
 	"github.com/v2fly/v2ray-core/v5/infra/conf/synthetic/dns"
 	"github.com/v2fly/v2ray-core/v5/infra/conf/synthetic/log"
 	"github.com/v2fly/v2ray-core/v5/infra/conf/synthetic/router"
+	"github.com/v2fly/v2ray-core/v5/infra/conf/v5cfg"
 )
 
 var (
@@ -30,6 +35,7 @@ var (
 		"vless":         func() interface{} { return new(VLessInboundConfig) },
 		"vmess":         func() interface{} { return new(VMessInboundConfig) },
 		"trojan":        func() interface{} { return new(TrojanServerConfig) },
+		"hysteria2":     func() interface{} { return new(Hysteria2ServerConfig) },
 	}, "protocol", "settings")
 
 	outboundConfigLoader = loader.NewJSONConfigLoader(loader.ConfigCreatorCache{
@@ -41,6 +47,7 @@ var (
 		"vless":       func() interface{} { return new(VLessOutboundConfig) },
 		"vmess":       func() interface{} { return new(VMessOutboundConfig) },
 		"trojan":      func() interface{} { return new(TrojanClientConfig) },
+		"hysteria2":   func() interface{} { return new(Hysteria2ClientConfig) },
 		"dns":         func() interface{} { return new(DNSOutboundConfig) },
 		"loopback":    func() interface{} { return new(LoopbackConfig) },
 	}, "protocol", "settings")
@@ -120,7 +127,7 @@ func (c *InboundDetourConfig) Build() (*core.InboundHandlerConfig, error) {
 	} else {
 		// Listen on specific IP or Unix Domain Socket
 		receiverSettings.Listen = c.ListenOn.Build()
-		listenDS := c.ListenOn.Family().IsDomain() && (c.ListenOn.Domain()[0] == '/' || c.ListenOn.Domain()[0] == '@')
+		listenDS := c.ListenOn.Family().IsDomain() && (filepath.IsAbs(c.ListenOn.Domain()) || c.ListenOn.Domain()[0] == '@')
 		listenIP := c.ListenOn.Family().IsIP() || (c.ListenOn.Family().IsDomain() && c.ListenOn.Domain() == "localhost")
 		switch {
 		case listenIP:
@@ -202,13 +209,14 @@ func (c *InboundDetourConfig) Build() (*core.InboundHandlerConfig, error) {
 }
 
 type OutboundDetourConfig struct {
-	Protocol      string                `json:"protocol"`
-	SendThrough   *cfgcommon.Address    `json:"sendThrough"`
-	Tag           string                `json:"tag"`
-	Settings      *json.RawMessage      `json:"settings"`
-	StreamSetting *StreamConfig         `json:"streamSettings"`
-	ProxySettings *proxycfg.ProxyConfig `json:"proxySettings"`
-	MuxSettings   *muxcfg.MuxConfig     `json:"mux"`
+	Protocol       string                `json:"protocol"`
+	SendThrough    *cfgcommon.Address    `json:"sendThrough"`
+	Tag            string                `json:"tag"`
+	Settings       *json.RawMessage      `json:"settings"`
+	StreamSetting  *StreamConfig         `json:"streamSettings"`
+	ProxySettings  *proxycfg.ProxyConfig `json:"proxySettings"`
+	MuxSettings    *muxcfg.MuxConfig     `json:"mux"`
+	DomainStrategy string                `json:"domainStrategy"`
 }
 
 // Build implements Buildable.
@@ -241,6 +249,16 @@ func (c *OutboundDetourConfig) Build() (*core.OutboundHandlerConfig, error) {
 
 	if c.MuxSettings != nil {
 		senderSettings.MultiplexSettings = c.MuxSettings.Build()
+	}
+
+	senderSettings.DomainStrategy = proxyman.SenderConfig_AS_IS
+	switch strings.ToLower(c.DomainStrategy) {
+	case "useip", "use_ip", "use-ip":
+		senderSettings.DomainStrategy = proxyman.SenderConfig_USE_IP
+	case "useip4", "useipv4", "use_ip4", "use_ipv4", "use_ip_v4", "use-ip4", "use-ipv4", "use-ip-v4":
+		senderSettings.DomainStrategy = proxyman.SenderConfig_USE_IP4
+	case "useip6", "useipv6", "use_ip6", "use_ipv6", "use_ip_v6", "use-ip6", "use-ipv6", "use-ip-v6":
+		senderSettings.DomainStrategy = proxyman.SenderConfig_USE_IP6
 	}
 
 	settings := []byte("{}")
@@ -302,7 +320,7 @@ type Config struct {
 	API              *APIConfig              `json:"api"`
 	Stats            *StatsConfig            `json:"stats"`
 	Reverse          *ReverseConfig          `json:"reverse"`
-	FakeDNS          *FakeDNSConfig          `json:"fakeDns"`
+	FakeDNS          *dns.FakeDNSConfig      `json:"fakeDns"`
 	BrowserForwarder *BrowserForwarderConfig `json:"browserForwarder"`
 	Observatory      *ObservatoryConfig      `json:"observatory"`
 	BurstObservatory *BurstObservatoryConfig `json:"burstObservatory"`
@@ -399,6 +417,17 @@ func (c *Config) Build() (*core.Config, error) {
 		config.App = append(config.App, serial.ToTypedMessage(routerConfig))
 	}
 
+	if c.FakeDNS != nil {
+		features.PrintDeprecatedFeatureWarning("root fakedns settings")
+		if c.DNSConfig != nil {
+			c.DNSConfig.FakeDNS = c.FakeDNS
+		} else {
+			c.DNSConfig = &dns.DNSConfig{
+				FakeDNS: c.FakeDNS,
+			}
+		}
+	}
+
 	if c.DNSConfig != nil {
 		dnsApp, err := c.DNSConfig.Build()
 		if err != nil {
@@ -417,14 +446,6 @@ func (c *Config) Build() (*core.Config, error) {
 
 	if c.Reverse != nil {
 		r, err := c.Reverse.Build()
-		if err != nil {
-			return nil, err
-		}
-		config.App = append(config.App, serial.ToTypedMessage(r))
-	}
-
-	if c.FakeDNS != nil {
-		r, err := c.FakeDNS.Build()
 		if err != nil {
 			return nil, err
 		}
@@ -465,15 +486,12 @@ func (c *Config) Build() (*core.Config, error) {
 
 	// Load Additional Services that do not have a json translator
 
-	if msg, err := c.BuildServices(c.Services); err != nil {
-		developererr := newError("Loading a V2Ray Features as a service is intended for developers only. " +
-			"This is used for developers to prototype new features or for an advanced client to use special features in V2Ray," +
-			" instead of allowing end user to enable it without special tool and knowledge.")
-		sb := strings.Builder{}
-		return nil, newError("Cannot load service").Base(developererr).Base(err).Base(newError(sb.String()))
-	} else { // nolint: revive
-		// Using a else here is required to keep msg in scope
-		config.App = append(config.App, msg...)
+	for serviceName, service := range c.Services {
+		servicePackedConfig, err := v5cfg.LoadHeterogeneousConfigFromRawJSON(context.Background(), "service", serviceName, *service)
+		if err != nil {
+			return nil, newError(fmt.Sprintf("failed to parse %v config in Services", serviceName)).Base(err)
+		}
+		config.App = append(config.App, serial.ToTypedMessage(servicePackedConfig))
 	}
 
 	var inbounds []InboundDetourConfig

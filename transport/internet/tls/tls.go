@@ -17,6 +17,13 @@ type Conn struct {
 	*tls.Conn
 }
 
+func (c *Conn) GetConnectionApplicationProtocol() (string, error) {
+	if err := c.Handshake(); err != nil {
+		return "", err
+	}
+	return c.ConnectionState().NegotiatedProtocol, nil
+}
+
 func (c *Conn) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	mb = buf.Compact(mb)
 	mb, err := buf.WriteMultiBuffer(c, mb)
@@ -36,7 +43,7 @@ func (c *Conn) HandshakeAddress() net.Address {
 }
 
 // Client initiates a TLS client handshake on the given connection.
-func Client(c net.Conn, config *tls.Config) net.Conn {
+func Client(c net.Conn, config *tls.Config) *Conn {
 	tlsConn := tls.Client(c, config)
 	return &Conn{Conn: tlsConn}
 }
@@ -66,6 +73,6 @@ func Server(c net.Conn, config *tls.Config) net.Conn {
 
 func init() {
 	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
-		return nil, newError("tls should be used with v2tls")
+		return NewTLSSecurityEngineFromConfig(config.(*Config))
 	}))
 }

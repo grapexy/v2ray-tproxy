@@ -35,7 +35,10 @@ func init() {
 	common.Must(common.RegisterConfig((*SimplifiedConfig)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
 		simplifiedServer := config.(*SimplifiedConfig)
 		_ = simplifiedServer
-		fullConfig := &Config{}
+		fullConfig := &Config{
+			DestinationOverride: simplifiedServer.DestinationOverride,
+			ProtocolReplacement: simplifiedServer.ProtocolReplacement,
+		}
 		return common.CreateObject(ctx, fullConfig)
 	}))
 }
@@ -65,24 +68,11 @@ func (h *Handler) policy() policy.Session {
 }
 
 func (h *Handler) resolveIP(ctx context.Context, domain string, localAddr net.Address) net.Address {
-	if c, ok := h.dns.(dns.ClientWithIPOption); ok {
-		c.SetFakeDNSOption(false) // Skip FakeDNS
-	} else {
-		newError("DNS client doesn't implement ClientWithIPOption")
-	}
-
-	lookupFunc := h.dns.LookupIP
-	if h.config.DomainStrategy == Config_USE_IP4 || (localAddr != nil && localAddr.Family().IsIPv4()) {
-		if lookupIPv4, ok := h.dns.(dns.IPv4Lookup); ok {
-			lookupFunc = lookupIPv4.LookupIPv4
-		}
-	} else if h.config.DomainStrategy == Config_USE_IP6 || (localAddr != nil && localAddr.Family().IsIPv6()) {
-		if lookupIPv6, ok := h.dns.(dns.IPv6Lookup); ok {
-			lookupFunc = lookupIPv6.LookupIPv6
-		}
-	}
-
-	ips, err := lookupFunc(domain)
+	ips, err := dns.LookupIPWithOption(h.dns, domain, dns.IPOption{
+		IPv4Enable: h.config.DomainStrategy == Config_USE_IP || h.config.DomainStrategy == Config_USE_IP4 || (localAddr != nil && localAddr.Family().IsIPv4()),
+		IPv6Enable: h.config.DomainStrategy == Config_USE_IP || h.config.DomainStrategy == Config_USE_IP6 || (localAddr != nil && localAddr.Family().IsIPv6()),
+		FakeEnable: false,
+	})
 	if err != nil {
 		newError("failed to get IP address for domain ", domain).Base(err).WriteToLog(session.ExportIDToError(ctx))
 	}
@@ -117,6 +107,19 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			destination.Port = net.Port(server.Port)
 		}
 	}
+	if h.config.ProtocolReplacement != ProtocolReplacement_IDENTITY {
+		if h.config.ProtocolReplacement == ProtocolReplacement_FORCE_TCP {
+			destination.Network = net.Network_TCP
+		}
+		if h.config.ProtocolReplacement == ProtocolReplacement_FORCE_UDP {
+			destination.Network = net.Network_UDP
+		}
+	}
+	if h.config.useIP() {
+		outbound.Resolver = func(ctx context.Context, domain string) net.Address {
+			return h.resolveIP(ctx, domain, dialer.Address())
+		}
+	}
 	newError("opening connection to ", destination).WriteToLog(session.ExportIDToError(ctx))
 
 	input := link.Reader
@@ -124,20 +127,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 	var conn internet.Connection
 	err := retry.ExponentialBackoff(5, 100).On(func() error {
-		dialDest := destination
-		if h.config.useIP() && dialDest.Address.Family().IsDomain() {
-			ip := h.resolveIP(ctx, dialDest.Address.Domain(), dialer.Address())
-			if ip != nil {
-				dialDest = net.Destination{
-					Network: dialDest.Network,
-					Address: ip,
-					Port:    dialDest.Port,
-				}
-				newError("dialing to ", dialDest).WriteToLog(session.ExportIDToError(ctx))
-			}
-		}
-
-		rawConn, err := dialer.Dial(ctx, dialDest)
+		rawConn, err := dialer.Dial(ctx, destination)
 		if err != nil {
 			return err
 		}
@@ -174,7 +164,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		defer timer.SetTimeout(plcy.Timeouts.UplinkOnly)
 
 		var reader buf.Reader
-		if destination.Network == net.Network_TCP {
+		if destination.Network == net.Network_TCP && h.config.ProtocolReplacement == ProtocolReplacement_IDENTITY {
 			reader = buf.NewReader(conn)
 		} else {
 			reader = buf.NewPacketReader(conn)

@@ -7,11 +7,12 @@ import (
 	"encoding/binary"
 	"io"
 
-	"github.com/lucas-clemente/quic-go/quicvarint"
+	"github.com/quic-go/quic-go/quicvarint"
 	"golang.org/x/crypto/hkdf"
 
 	"github.com/v2fly/v2ray-core/v5/common"
 	"github.com/v2fly/v2ray-core/v5/common/buf"
+	"github.com/v2fly/v2ray-core/v5/common/bytespool"
 	"github.com/v2fly/v2ray-core/v5/common/errors"
 	ptls "github.com/v2fly/v2ray-core/v5/common/protocol/tls"
 )
@@ -36,10 +37,10 @@ const (
 var (
 	quicSaltOld  = []byte{0xaf, 0xbf, 0xec, 0x28, 0x99, 0x93, 0xd2, 0x4c, 0x9e, 0x97, 0x86, 0xf1, 0x9c, 0x61, 0x11, 0xe0, 0x43, 0x90, 0xa8, 0x99}
 	quicSalt     = []byte{0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a}
-	initialSuite = &CipherSuiteTLS13{
+	initialSuite = &cipherSuiteTLS13{
 		ID:     tls.TLS_AES_128_GCM_SHA256,
 		KeyLen: 16,
-		AEAD:   AEADAESGCMTLS13,
+		AEAD:   aeadAESGCMTLS13,
 		Hash:   crypto.SHA256,
 	}
 	errNotQuic        = errors.New("not quic")
@@ -142,7 +143,7 @@ func SniffQUIC(b []byte) (*SniffHeader, error) {
 		packetNumber = uint32(n)
 	}
 
-	if packetNumber != 0 {
+	if packetNumber != 0 && packetNumber != 1 {
 		return nil, errNotQuicInitial
 	}
 
@@ -152,7 +153,7 @@ func SniffQUIC(b []byte) (*SniffHeader, error) {
 
 	key := hkdfExpandLabel(crypto.SHA256, secret, []byte{}, "quic key", 16)
 	iv := hkdfExpandLabel(crypto.SHA256, secret, []byte{}, "quic iv", 12)
-	cipher := AEADAESGCMTLS13(key, iv)
+	cipher := aeadAESGCMTLS13(key, iv)
 	nonce := cache.Extend(int32(cipher.NonceSize()))
 	binary.BigEndian.PutUint64(nonce[len(nonce)-8:], uint64(packetNumber))
 	decrypted, err := cipher.Open(b[extHdrLen:extHdrLen], nonce, data, b[:extHdrLen])
@@ -160,32 +161,92 @@ func SniffQUIC(b []byte) (*SniffHeader, error) {
 		return nil, err
 	}
 	buffer = buf.FromBytes(decrypted)
-	frameType, err := buffer.ReadByte()
-	if err != nil {
-		return nil, io.ErrUnexpectedEOF
+
+	cryptoLen := uint(0)
+	cryptoData := bytespool.Alloc(buffer.Len())
+	defer bytespool.Free(cryptoData)
+	for i := 0; !buffer.IsEmpty(); i++ {
+		frameType := byte(0x0) // Default to PADDING frame
+		for frameType == 0x0 && !buffer.IsEmpty() {
+			frameType, _ = buffer.ReadByte()
+		}
+		switch frameType {
+		case 0x00: // PADDING frame
+		case 0x01: // PING frame
+		case 0x02, 0x03: // ACK frame
+			if _, err = quicvarint.Read(buffer); err != nil { // Field: Largest Acknowledged
+				return nil, io.ErrUnexpectedEOF
+			}
+			if _, err = quicvarint.Read(buffer); err != nil { // Field: ACK Delay
+				return nil, io.ErrUnexpectedEOF
+			}
+			ackRangeCount, err := quicvarint.Read(buffer) // Field: ACK Range Count
+			if err != nil {
+				return nil, io.ErrUnexpectedEOF
+			}
+			if _, err = quicvarint.Read(buffer); err != nil { // Field: First ACK Range
+				return nil, io.ErrUnexpectedEOF
+			}
+			for i := 0; i < int(ackRangeCount); i++ { // Field: ACK Range
+				if _, err = quicvarint.Read(buffer); err != nil { // Field: ACK Range -> Gap
+					return nil, io.ErrUnexpectedEOF
+				}
+				if _, err = quicvarint.Read(buffer); err != nil { // Field: ACK Range -> ACK Range Length
+					return nil, io.ErrUnexpectedEOF
+				}
+			}
+			if frameType == 0x03 {
+				if _, err = quicvarint.Read(buffer); err != nil { // Field: ECN Counts -> ECT0 Count
+					return nil, io.ErrUnexpectedEOF
+				}
+				if _, err = quicvarint.Read(buffer); err != nil { // Field: ECN Counts -> ECT1 Count
+					return nil, io.ErrUnexpectedEOF
+				}
+				if _, err = quicvarint.Read(buffer); err != nil { //nolint:misspell // Field: ECN Counts -> ECT-CE Count
+					return nil, io.ErrUnexpectedEOF
+				}
+			}
+		case 0x06: // CRYPTO frame, we will use this frame
+			offset, err := quicvarint.Read(buffer) // Field: Offset
+			if err != nil {
+				return nil, io.ErrUnexpectedEOF
+			}
+			length, err := quicvarint.Read(buffer) // Field: Length
+			if err != nil || length > uint64(buffer.Len()) {
+				return nil, io.ErrUnexpectedEOF
+			}
+			if cryptoLen < uint(offset+length) {
+				cryptoLen = uint(offset + length)
+			}
+			if _, err := buffer.Read(cryptoData[offset : offset+length]); err != nil { // Field: Crypto Data
+				return nil, io.ErrUnexpectedEOF
+			}
+		case 0x1c: // CONNECTION_CLOSE frame, only 0x1c is permitted in initial packet
+			if _, err = quicvarint.Read(buffer); err != nil { // Field: Error Code
+				return nil, io.ErrUnexpectedEOF
+			}
+			if _, err = quicvarint.Read(buffer); err != nil { // Field: Frame Type
+				return nil, io.ErrUnexpectedEOF
+			}
+			length, err := quicvarint.Read(buffer) // Field: Reason Phrase Length
+			if err != nil {
+				return nil, io.ErrUnexpectedEOF
+			}
+			if _, err := buffer.ReadBytes(int32(length)); err != nil { // Field: Reason Phrase
+				return nil, io.ErrUnexpectedEOF
+			}
+		default:
+			// Only above frame types are permitted in initial packet.
+			// See https://www.rfc-editor.org/rfc/rfc9000.html#section-17.2.2-8
+			return nil, errNotQuicInitial
+		}
 	}
-	if frameType != 0x6 {
-		// not crypto frame
-		return &SniffHeader{domain: ""}, nil
-	}
-	if common.Error2(quicvarint.Read(buffer)) != nil {
-		return nil, io.ErrUnexpectedEOF
-	}
-	dataLen, err := quicvarint.Read(buffer)
-	if err != nil {
-		return nil, io.ErrUnexpectedEOF
-	}
-	if dataLen > uint64(buffer.Len()) {
-		return nil, io.ErrUnexpectedEOF
-	}
-	frameData, err := buffer.ReadBytes(int32(dataLen))
-	common.Must(err)
+
 	tlsHdr := &ptls.SniffHeader{}
-	err = ptls.ReadClientHello(frameData, tlsHdr)
+	err = ptls.ReadClientHello(cryptoData[:cryptoLen], tlsHdr)
 	if err != nil {
 		return nil, err
 	}
-
 	return &SniffHeader{domain: tlsHdr.Domain()}, nil
 }
 

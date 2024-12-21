@@ -38,6 +38,8 @@ var upgrader = &websocket.Upgrader{
 }
 
 func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+	responseHeader := http.Header{}
+
 	var earlyData io.Reader
 	if !h.earlyDataEnabled { // nolint: gocritic
 		if request.URL.Path != h.path {
@@ -51,6 +53,9 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 		}
 		earlyDataStr := request.Header.Get(h.earlyDataHeaderName)
 		earlyData = base64.NewDecoder(base64.RawURLEncoding, bytes.NewReader([]byte(earlyDataStr)))
+		if strings.EqualFold("Sec-WebSocket-Protocol", h.earlyDataHeaderName) {
+			responseHeader.Set(h.earlyDataHeaderName, earlyDataStr)
+		}
 	} else {
 		if strings.HasPrefix(request.URL.RequestURI(), h.path) {
 			earlyDataStr := request.URL.RequestURI()[len(h.path):]
@@ -61,7 +66,7 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 		}
 	}
 
-	conn, err := upgrader.Upgrade(writer, request, nil)
+	conn, err := upgrader.Upgrade(writer, request, responseHeader)
 	if err != nil {
 		newError("failed to convert to WebSocket connection").Base(err).WriteToLog()
 		return
@@ -88,7 +93,6 @@ type Listener struct {
 	listener net.Listener
 	config   *Config
 	addConn  internet.ConnHandler
-	locker   *internet.FileLocker // for unix domain socket
 }
 
 func ListenWS(ctx context.Context, address net.Address, port net.Port, streamSettings *internet.MemoryStreamConfig, addConn internet.ConnHandler) (internet.Listener, error) {
@@ -114,10 +118,6 @@ func ListenWS(ctx context.Context, address net.Address, port net.Port, streamSet
 			return nil, newError("failed to listen unix domain socket(for WS) on ", address).Base(err)
 		}
 		newError("listening unix domain socket(for WS) on ", address).WriteToLog(session.ExportIDToError(ctx))
-		locker := ctx.Value(address.Domain())
-		if locker != nil {
-			l.locker = locker.(*internet.FileLocker)
-		}
 	} else { // tcp
 		listener, err = internet.ListenSystem(ctx, &net.TCPAddr{
 			IP:   address.IP(),
@@ -174,9 +174,6 @@ func (ln *Listener) Addr() net.Addr {
 
 // Close implements net.Listener.Close().
 func (ln *Listener) Close() error {
-	if ln.locker != nil {
-		ln.locker.Release()
-	}
 	return ln.listener.Close()
 }
 

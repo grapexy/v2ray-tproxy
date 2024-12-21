@@ -15,6 +15,7 @@ import (
 	"github.com/v2fly/v2ray-core/v5/common/net"
 	"github.com/v2fly/v2ray-core/v5/common/protocol"
 	"github.com/v2fly/v2ray-core/v5/common/session"
+	"github.com/v2fly/v2ray-core/v5/common/strmatcher"
 	"github.com/v2fly/v2ray-core/v5/features/outbound"
 	"github.com/v2fly/v2ray-core/v5/features/policy"
 	"github.com/v2fly/v2ray-core/v5/features/routing"
@@ -182,7 +183,7 @@ func shouldOverride(result SniffResult, domainOverride []string) bool {
 		protocolString = resComp.ProtocolForDomainResult()
 	}
 	for _, p := range domainOverride {
-		if strings.HasPrefix(protocolString, p) {
+		if strings.HasPrefix(protocolString, p) || strings.HasSuffix(protocolString, p) {
 			return true
 		}
 		if resultSubset, ok := result.(SnifferIsProtoSubsetOf); ok {
@@ -224,10 +225,11 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 				content.Protocol = result.Protocol()
 			}
 			if err == nil && shouldOverride(result, sniffingRequest.OverrideDestinationForProtocol) {
-				domain := result.Domain()
-				newError("sniffed domain: ", domain).WriteToLog(session.ExportIDToError(ctx))
-				destination.Address = net.ParseAddress(domain)
-				ob.Target = destination
+				if domain, err := strmatcher.ToDomain(result.Domain()); err == nil {
+					newError("sniffed domain: ", domain, " for ", destination).WriteToLog(session.ExportIDToError(ctx))
+					destination.Address = net.ParseAddress(domain)
+					ob.Target = destination
+				}
 			}
 			d.routedDispatch(ctx, outbound, destination)
 		}()
@@ -324,6 +326,9 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 	if accessMessage := log.AccessMessageFromContext(ctx); accessMessage != nil {
 		if tag := handler.Tag(); tag != "" {
 			accessMessage.Detour = tag
+			if d.policy.ForSystem().OverrideAccessLogDest {
+				accessMessage.To = destination
+			}
 		}
 		log.Record(accessMessage)
 	}
